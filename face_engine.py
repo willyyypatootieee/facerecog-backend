@@ -15,7 +15,6 @@ for d in [DATA_DIR, FACES_DIR, MODELS_DIR]:
     if not os.path.exists(d):
         os.makedirs(d)
 
-# Download ONNX models if they don't exist
 DETECTOR_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 RECOGNIZER_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
@@ -30,88 +29,124 @@ if not os.path.exists(RECOGNIZER_PATH):
     print("Downloading SFace Face Recognizer...")
     urllib.request.urlretrieve(RECOGNIZER_URL, RECOGNIZER_PATH)
 
-# Initialize models
 detector = cv2.FaceDetectorYN.create(DETECTOR_PATH, "", (320, 320), 0.9, 0.3, 5000)
 recognizer = cv2.FaceRecognizerSF.create(RECOGNIZER_PATH, "")
 
-# Load DB
-if os.path.exists(DB_PATH):
-    with open(DB_PATH, "rb") as f:
-        embeddings_db = pickle.load(f)
-else:
-    embeddings_db = {}
+import json
+from database import SessionLocal
+import models
 
-def save_db():
-    with open(DB_PATH, "wb") as f:
-        pickle.dump(embeddings_db, f)
+def load_embeddings_from_db():
+    db = SessionLocal()
+    embeddings = {}
+    db_embeddings = db.query(models.FaceEmbedding).all()
+    for db_emb in db_embeddings:
+        user = db.query(models.User).filter(models.User.id == db_emb.user_id).first()
+        if user and db_emb.embedding_data:
+            emb_list = json.loads(db_emb.embedding_data)
+            embeddings[user.nrp] = np.array(emb_list, dtype=np.float32)
+    db.close()
+    return embeddings
 
-def get_embedding(img_array):
+embeddings_db = load_embeddings_from_db()
+
+def get_faces_and_embeddings(img_array):
     """
-    Extract face embedding from an image array using OpenCV SFace.
+    Extract multiple face embeddings from an image array.
+    Returns a list of tuples: [(face_box, embedding), ...]
     """
+    results = []
     try:
         height, width, _ = img_array.shape
         detector.setInputSize((width, height))
         
-        # Detect faces
         _, faces = detector.detect(img_array)
-        if faces is not None and len(faces) > 0:
-            # Get the first face
-            face = faces[0]
-            # Align face
-            aligned_face = recognizer.alignCrop(img_array, face)
-            # Extract feature
-            feature = recognizer.feature(aligned_face)
-            return feature[0]
+        if faces is not None:
+            for face in faces:
+                aligned_face = recognizer.alignCrop(img_array, face)
+                feature = recognizer.feature(aligned_face)
+                results.append((face, feature[0]))
     except Exception as e:
-        print(f"Error extracting embedding: {e}")
+        print(f"Error extracting embeddings: {e}")
+    return results
+
+def get_embedding(img_array):
+    """
+    Extract a single (primary) face embedding.
+    """
+    faces_data = get_faces_and_embeddings(img_array)
+    if len(faces_data) > 0:
+        return faces_data[0][1] 
     return None
 
 def register_face(name: str, img_array: np.ndarray) -> bool:
     """
-    Registers a face. Returns True if successful.
+    Registers a face in-memory. DB saving handled by router.
     """
     embedding = get_embedding(img_array)
     if embedding is not None:
         embeddings_db[name] = embedding
-        save_db()
         cv2.imwrite(os.path.join(FACES_DIR, f"{name}.jpg"), img_array)
-        return True
-    return False
+        return True, embedding.tolist()
+    return False, None
 
-def recognize_face(img_array: np.ndarray, threshold: float = 0.363) -> dict:
+def check_liveness(img_array: np.ndarray, face_box) -> float:
     """
-    Recognizes a face using SFace. SFace cosine threshold is ~0.363.
-    Returns a dict with 'user' (name or None) and 'embedding' (list or None).
-    """
-    embedding = get_embedding(img_array)
-    if embedding is None:
-        return {"user": None, "embedding": None}
-
-    emb_list = embedding.tolist()
-
-    if not embeddings_db:
-        return {"user": None, "embedding": emb_list}
+    Placeholder for Liveness Detection (Anti-Spoofing).
+    In production, you load an ONNX model (e.g., MiniFASNet) here, crop the face using face_box,
+    and run inference to get a real/spoof score.
     
-    best_match = None
-    best_dist = float("inf")
+    Returns a liveness confidence score (0.0 to 1.0).
+    """
+    # 1. Crop face from img_array using face_box coordinates
+    # x, y, w, h = int(face_box[0]), int(face_box[1]), int(face_box[2]), int(face_box[3])
+    # face_crop = img_array[y:y+h, x:x+w]
+    
+    # 2. Run your Anti-Spoofing ONNX model inference here
+    # liveness_score = anti_spoof_model.predict(face_crop)
+    
+    # Returning a mock score of 0.95 (Real) for now.
+    # Change to random.uniform(0.0, 1.0) to test spoof rejections.
+    return 0.95
+
+def recognize_faces(img_array: np.ndarray, threshold: float = 0.35) -> list:
+    """
+    Recognizes all faces in an image using SFace.
+    Returns a list of dicts including liveness score.
+    """
+    face_features = get_faces_and_embeddings(img_array)
+    results = []
 
     def cosine_distance(a, b):
         return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    for name, db_emb in embeddings_db.items():
-        dist = cosine_distance(embedding, db_emb)
-        if dist < best_dist:
-            best_dist = dist
-            best_match = name
-            
-    print(f"Best match: {best_match} with distance: {best_dist}")
-    
-    # SFace threshold for cosine distance is typically around 0.363
-    # We use 0.35 by default in the API to be slightly more accurate.
-    if best_dist < threshold:
-        return {"user": best_match, "embedding": emb_list}
-    return {"user": None, "embedding": emb_list}
+    for face_box, embedding in face_features:
+        emb_list = embedding.tolist()
+        
+        # Check liveness for this face
+        liveness_score = check_liveness(img_array, face_box)
+
+        if not embeddings_db:
+            results.append({"user": None, "embedding": emb_list, "distance": 1.0, "box": face_box.tolist(), "liveness": liveness_score})
+            continue
+        
+        best_match = None
+        best_dist = float("inf")
+
+        for nrp, db_emb in embeddings_db.items():
+            dist = cosine_distance(embedding, db_emb)
+            if dist < best_dist:
+                best_dist = dist
+                best_match = nrp
+                
+        print(f"Face recognized - Best match: {best_match} with distance: {best_dist}, Liveness: {liveness_score}")
+        
+        if best_dist < threshold:
+            results.append({"user": best_match, "embedding": emb_list, "distance": float(best_dist), "box": face_box.tolist(), "liveness": liveness_score})
+        else:
+            results.append({"user": None, "embedding": emb_list, "distance": float(best_dist), "box": face_box.tolist(), "liveness": liveness_score})
+
+    return results
 
 class CameraStream:
     def __init__(self, index=0):
