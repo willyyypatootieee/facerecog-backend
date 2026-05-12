@@ -1,15 +1,20 @@
 import cv2
 import numpy as np
 import base64
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
-from fastapi.responses import JSONResponse
+import json
+import datetime
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from typing import Optional
+from sqlalchemy.orm import Session
+from typing import Optional, List
 
-from face_engine import register_face, recognize_face, camera_stream
+from database import engine, get_db, Base
+import models
+import schemas
+from face_engine import register_face, recognize_faces, camera_stream, embeddings_db
 
-app = FastAPI()
+app = FastAPI(title="Face Recognition Attendance API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,40 +40,189 @@ def decode_base64_image(base64_string: str) -> np.ndarray:
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
 
 @app.post("/register")
-async def register(name: str = Form(...), image: str = Form(...)):
+async def register(
+    nrp: str = Form(...),
+    nama: str = Form(...),
+    jurusan: str = Form(...),
+    role: str = Form("student"),
+    image: str = Form(...),
+    db: Session = Depends(get_db)
+):
     """
-    Registers a new user given a base64 encoded image and a name.
+    Registers a new user mapping to nrp, and stores embedding.
     """
     img_array = decode_base64_image(image)
     if img_array is None:
         raise HTTPException(status_code=400, detail="Could not decode image")
     
-    success = register_face(name, img_array)
-    if success:
-        return {"status": "success", "message": f"User {name} registered successfully."}
-    else:
+    success, emb_list = register_face(nrp, img_array)
+    if not success:
         raise HTTPException(status_code=400, detail="No face detected in the image.")
 
+    user = db.query(models.User).filter(models.User.nrp == nrp).first()
+    if not user:
+        user = models.User(nrp=nrp, nama=nama, jurusan=jurusan, role=role)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    face_emb = models.FaceEmbedding(user_id=user.id, embedding_data=json.dumps(emb_list))
+    db.add(face_emb)
+    db.commit()
+
+    return {"status": "success", "message": f"User {nama} ({nrp}) registered successfully."}
+
+def get_active_schedule(db: Session) -> Optional[models.Schedule]:
+    """ Returns the currently active schedule object. """
+    active_sched = db.query(models.Schedule).filter(models.Schedule.is_active == True).first()
+    if active_sched:
+        return active_sched
+    
+    now = datetime.datetime.now()
+    days = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    current_day = days[now.weekday()]
+    curr_time = now.strftime("%H:%M")
+
+    schedules = db.query(models.Schedule).filter(models.Schedule.day_of_week == current_day).all()
+    for s in schedules:
+        if s.start_time <= curr_time <= s.end_time:
+            return s
+            
+    return None
+
 @app.post("/attendance")
-async def attendance(image: str = Form(...)):
+async def attendance(image: str = Form(...), db: Session = Depends(get_db)):
     """
-    Marks attendance by recognizing the face in the provided base64 encoded image.
+    Marks attendance if active schedule allows, user found, and cooldown passed.
+    Handles multiple faces. Parses 'Late' vs 'Present'.
     """
+    active_schedule = get_active_schedule(db)
+    if not active_schedule:
+         return JSONResponse(status_code=403, content={"status": "fail", "detail": "No active class schedule for face recognition right now."})
+
     img_array = decode_base64_image(image)
     if img_array is None:
         raise HTTPException(status_code=400, detail="Could not decode image")
     
-    result = recognize_face(img_array, threshold=0.35)
-    emb = result.get("embedding")
+    recognized_faces = recognize_faces(img_array, threshold=0.35)
+    if not recognized_faces:
+        raise HTTPException(status_code=400, detail="No faces found.")
 
-    if emb is None:
-        raise HTTPException(status_code=400, detail="No face found.")
+    now = datetime.datetime.now()
+    try:
+        start_time_obj = datetime.datetime.strptime(active_schedule.start_time, "%H:%M").time()
+        start_dt = datetime.datetime.combine(now.date(), start_time_obj)
+        if (now - start_dt).total_seconds() > 15 * 60:
+            attendance_status = "late"
+        else:
+            attendance_status = "present"
+    except:
+        attendance_status = "present"
 
-    name = result.get("user")
-    if name:
-        return {"status": "success", "message": f"Welcome, {name}!", "user": name, "embedding": emb}
+    success_messages = []
+    
+    for result in recognized_faces:
+        nrp = result.get("user")
+        distance = result.get("distance", 1.0)
+        liveness = result.get("liveness", 1.0)
+        confidence = max(0, 1.0 - distance)
+
+        # Liveness Anti-Spoofing check (threshold set to 0.70)
+        if liveness < 0.70:
+            print(f"Spoof detected for {nrp} - Score: {liveness}")
+            continue
+
+        if not nrp:
+            continue # Skip unrecognized faces in bulk processing
+
+        user = db.query(models.User).filter(models.User.nrp == nrp).first()
+        if not user:
+            continue
+
+        # Cooldown check (prevent multiple entries within 1 hour)
+        one_hour_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
+        recent = db.query(models.Attendance).filter(
+            models.Attendance.user_id == user.id,
+            models.Attendance.schedule_id == active_schedule.id,
+            models.Attendance.timestamp >= one_hour_ago
+        ).first()
+
+        if recent:
+            success_messages.append(f"Already checked in: {user.nama}")
+            continue
+
+        # Record attendance with schedule ID
+        new_attendance = models.Attendance(
+            user_id=user.id, 
+            schedule_id=active_schedule.id,
+            status=attendance_status, 
+            confidence=confidence
+        )
+        db.add(new_attendance)
+        success_messages.append(f"Checked in [{attendance_status}]: {user.nama}")
+    
+    db.commit()
+
+    if not success_messages:
+        return JSONResponse(status_code=404, content={"status": "fail", "detail": "No recognized users could be checked in."})
+        
+    return {"status": "success", "message": "Attendance processed.", "details": success_messages}
+
+@app.get("/admin/schedules", response_model=List[schemas.ScheduleResponse])
+def get_schedules(db: Session = Depends(get_db)):
+    return db.query(models.Schedule).all()
+
+@app.post("/admin/schedules/{schedule_id}/force-open")
+def force_open_schedule(schedule_id: int, open: bool = True, db: Session = Depends(get_db)):
+    # Reset all first
+    db.query(models.Schedule).update({"is_active": False})
+    
+    if open:
+        sched = db.query(models.Schedule).filter(models.Schedule.id == schedule_id).first()
+        if not sched:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        sched.is_active = True
+    
+    db.commit()
+    status = "opened" if open else "closed"
+    return {"status": "success", "message": f"Schedule {status} manually."}
+
+@app.get("/admin/attendances")
+def get_attendances(db: Session = Depends(get_db)):
+    records = db.query(models.Attendance).all()
+    results = []
+    for r in records:
+        results.append({
+            "id": r.id,
+            "user_id": r.user_id,
+            "nrp": getattr(r.user, 'nrp', 'Unknown'),
+            "user": getattr(r.user, 'nama', 'Unknown'),
+            "schedule_id": r.schedule_id,
+            "timestamp": r.timestamp,
+            "status": r.status,
+            "confidence": r.confidence,
+            "class_name": getattr(r.schedule, 'class_name', 'Unknown') if r.schedule else 'Unknown'
+        })
+    return results
+
+from fastapi.responses import FileResponse
+import os
+from face_engine import FACES_DIR
+
+@app.get("/users/{nrp}/face")
+def get_user_face(nrp: str):
+    """
+    Returns the registered front face picture of the given NRP.
+    """
+    face_path = os.path.join(FACES_DIR, f"{nrp}.jpg")
+    if os.path.exists(face_path):
+        return FileResponse(face_path, media_type="image/jpeg")
     else:
-        return JSONResponse(status_code=404, content={"status": "fail", "detail": "Face not recognized.", "embedding": emb})
+        raise HTTPException(status_code=404, detail="Face image not found for this user.")
+
+@app.get("/api/swagger.json")
+def get_swagger_json():
+    return app.openapi()
 
 def generate_frames():
     import time
